@@ -1,0 +1,145 @@
+version: '3.8'
+
+services:
+  livekit-meet:
+    image: regis.derlo.com.br/meet-livekit:latest
+    restart: unless-stopped
+    networks:
+      - traefik_public
+    environment:
+      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
+      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
+      - LIVEKIT_URL=${LIVEKIT_URL}
+      - NEXT_PUBLIC_SHOW_SETTINGS_MENU=true
+      #- NEXT_PUBLIC_LK_RECORD_ENDPOINT="/api/record"
+      - S3_KEY_ID=${S3_KEY_ID}
+      - S3_KEY_SECRET=${S3_KEY_SECRET}
+      - S3_ENDPOINT=${S3_ENDPOINT}
+      - S3_BUCKET=${S3_BUCKET}
+      - S3_REGION=${S3_REGION}
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.worker == apps_3
+      labels:
+        - traefik.enable=true
+        - traefik.http.routers.livekit-meet.rule=Host(`meet.ballroom.com.br`)
+        - traefik.http.routers.livekit-meet.service=livekit-meet
+        - traefik.http.routers.livekit-meet.tls.certresolver=cloudflare
+        - traefik.http.routers.livekit-meet.entrypoints=websecure
+        - traefik.http.routers.livekit-meet.tls=true
+        - traefik.http.services.livekit-meet.loadbalancer.server.port=3000
+
+  livekit-server:
+    image: livekit/livekit-server:latest
+    restart: unless-stopped
+    networks:
+      - traefik_public
+    ports:
+      - "7882:7882/udp"
+      - "3478:3478/udp"
+      - target: 5349     # TURN TLS - apenas para Swarm mode
+        published: 5349
+        protocol: tcp
+        mode: host
+    volumes:
+      - livekit_data:/etc:ro
+    command: --dev --config /etc/livekit.yaml
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.worker == apps_3
+      labels:
+        - traefik.enable=true
+        # HTTP/HTTPS para API do LiveKit Server
+        - traefik.http.routers.livekit-server.rule=Host(`livekit.ballroom.com.br`)
+        - traefik.http.routers.livekit-server.service=livekit-server-http
+        - traefik.http.routers.livekit-server.tls.certresolver=cloudflare
+        - traefik.http.routers.livekit-server.entrypoints=websecure
+        - traefik.http.routers.livekit-server.tls=true
+        - traefik.http.services.livekit-server-http.loadbalancer.server.port=7880
+        # TCP para TURN Server TLS (porta 5349)
+        - traefik.tcp.routers.livekit-turn.rule=HostSNI(`turn.ballroom.com.br`)
+        - traefik.tcp.routers.livekit-turn.entrypoints=turn-tls
+        - traefik.tcp.routers.livekit-turn.service=livekit-turn-tcp
+        - traefik.tcp.routers.livekit-turn.tls.passthrough=true
+        - traefik.tcp.services.livekit-turn-tcp.loadbalancer.server.port=5349
+
+  livekit-egress:
+    image: livekit/egress:latest
+    restart: unless-stopped
+    networks:
+      - traefik_public
+    environment:
+      # Você pode usar config por arquivo ou via variáveis de ambiente
+      #- EGRESS_CONFIG_FILE=/etc/egress/config.yaml
+      EGRESS_CONFIG_BODY: |
+        api_key: ${LIVEKIT_API_KEY}
+        api_secret: ${LIVEKIT_API_SECRET}
+        ws_url: ${LIVEKIT_URL}          # ex: wss://livekit.ballroom.com.br
+        redis:
+          address: ${REDIS_HOST}:${REDIS_PORT}
+        logging:
+          level: info
+        health_port: 8081
+        s3:
+          access_key: ${S3_KEY_ID}
+          secret: ${S3_KEY_SECRET}
+          region: ${S3_REGION}
+          bucket: ${S3_BUCKET}
+          endpoint: ${S3_ENDPOINT}
+          force_path_style: true
+    volumes:
+      - egress_config:/etc/egress
+      - egress_output:/etc/egress/output  # onde gravar arquivos temporários / finais
+    deploy:
+      mode: replicated
+      replicas: 1   # ou mais, se você quiser gravação simultânea
+      placement:
+        constraints:
+          - node.labels.worker == apps_3
+      labels:
+        - traefik.enable=false  # geralmente o Egress não precisa exposição HTTP pública
+    # opcional: se quiser health-check HTTP interno ou métricas, expor porta de health ou prometheus
+    # ports:
+    #   - "9090:9090"   # health / métricas, se configurado no config
+
+  livekit-agent:
+    build:
+      context: ./livekit-agent   # crie este diretório com Dockerfile do seu agente
+    image: ballroom/livekit-agent:latest
+    restart: unless-stopped
+    networks: [traefik_public]
+    environment:
+      - LIVEKIT_URL=${LIVEKIT_URL}            # ex: wss://livekit.ballroom.com.br
+      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
+      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
+      # Coloque aqui secrets do seu agente (ex.: OPENAI_API_KEY, AZURE_*, GOOGLE_*, etc.)
+      # - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # - AZURE_SPEECH_KEY=${AZURE_SPEECH_KEY}
+      # - ...
+    command: ["python", "myagent.py", "start"]
+    deploy:
+      mode: replicated
+      replicas: 0         # aumente para escalar workers
+      placement:
+        constraints:
+          - node.labels.worker == apps_3
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+
+networks:
+  traefik_public:
+    external: true
+
+volumes:
+  egress_config:
+  egress_output:
+  livekit_data:
+    external: true
